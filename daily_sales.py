@@ -5,12 +5,13 @@ import argparse
 from copy import copy
 from dataclasses import dataclass
 from datetime import date
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import posixpath
 import re
 import tempfile
 from xml.etree import ElementTree as ET
+from xml.sax.saxutils import escape
 from zipfile import ZipFile
 
 NS = {'s': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
@@ -25,8 +26,14 @@ class Point:
     daily: Decimal | None = None
 
 
-def rounded(value: Decimal | None) -> int | None:
-    return None if value is None else int(max(Decimal(0), value).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+@dataclass(frozen=True)
+class Formula:
+    expression: str
+    cached: Decimal | int
+
+
+def nonnegative(value: Decimal | None) -> Decimal | None:
+    return None if value is None else max(Decimal(0), value)
 
 
 def below_cap(points: list[Point]) -> Decimal | None:
@@ -117,7 +124,7 @@ def discover_columns(row: ET.Element, strings: list[str], latest_year: int):
 
 
 CELL_PATTERN = re.compile(rb'<c\b[^>]*?(?:/>|>.*?</c>)', re.DOTALL)
-ROW_PATTERN = re.compile(rb'<row\b[^>]*>.*?</row>', re.DOTALL)
+ROW_PATTERN = re.compile(rb'<row\b[^>]*?(?:/>|>.*?</row>)', re.DOTALL)
 
 
 def column_index(ref: str) -> int:
@@ -127,16 +134,30 @@ def column_index(ref: str) -> int:
     return result
 
 
-def patch_xml(data: bytes, edits: dict[str, int | Decimal | None]) -> bytes:
+def patch_xml(data: bytes, edits: dict[str, int | Decimal | Formula | None],
+              styles: dict[str, str] | None = None) -> bytes:
     """只替换目标单元格值；其余 XML 字节（包括样式与图片公式）保持原样。"""
     remaining = dict(edits)
+    pending_styles = dict(styles or {})
+
+    def value_xml(value):
+        if isinstance(value, Formula):
+            return f'<f>{escape(value.expression)}</f><v>{value.cached}</v>'.encode()
+        return b'' if value is None else b'<v>' + str(value).encode('ascii') + b'</v>'
+
 
     def replace_cell(match):
         raw = match.group()
         ref_match = re.search(rb'\br="([A-Z]+\d+)"', raw)
-        if not ref_match or ref_match[1].decode() not in remaining:
+        if not ref_match:
             return raw
         ref = ref_match[1].decode()
+        if ref in pending_styles:
+            style = pending_styles.pop(ref)
+            raw = re.sub(rb'\s+s="[^"]*"', b'', raw, count=1)
+            raw = raw.replace(b'<c ', f'<c s="{style}" '.encode(), 1)
+        if ref not in remaining:
+            return raw
         value = remaining.pop(ref)
         opening = raw[:raw.index(b'>') + 1].replace(b'/>', b'>')
         opening = re.sub(rb'\s+t="[^"]*"', b'', opening)
@@ -144,20 +165,25 @@ def patch_xml(data: bytes, edits: dict[str, int | Decimal | None]) -> bytes:
         if re.search(rb'<f\b[^>]*\bt="(?:shared|array)"', body):
             raise ValueError(f'{ref} 含共享或数组公式，不支持局部替换')
         body = re.sub(rb'<(?:v|f|is)\b[^>]*?(?:/>|>.*?</(?:v|f|is)>)', b'', body, flags=re.DOTALL)
-        val = b'' if value is None else b'<v>' + str(value).encode('ascii') + b'</v>'
+        val = value_xml(value)
         return opening + val + body + b'</c>'
 
     data = CELL_PATTERN.sub(replace_cell, data)
     by_row = {}
-    for ref, val in remaining.items():
-        if val is not None:
+    for ref in remaining.keys() | pending_styles.keys():
+        val = remaining.get(ref)
+        if val is not None or ref in pending_styles:
             by_row.setdefault(re.search(r'\d+', ref)[0], []).append((ref, val))
 
     def insert_cells(match):
         raw = match.group()
         row_id = re.search(rb'\br="(\d+)"', raw)[1].decode()
-        for ref, value in sorted(by_row.pop(row_id, []), key=lambda item: column_index(item[0])):
-            cell = f'<c r="{ref}"><v>{value}</v></c>'.encode()
+        additions = by_row.pop(row_id, [])
+        if additions and raw.endswith(b'/>' ):
+            raw = raw[:-2] + b'></row>'
+        for ref, value in sorted(additions, key=lambda item: column_index(item[0])):
+            style = f' s="{pending_styles[ref]}"' if ref in pending_styles else ''
+            cell = f'<c r="{ref}"{style}>'.encode() + value_xml(value) + b'</c>'
             position = len(raw) - len(b'</row>')
             for existing in CELL_PATTERN.finditer(raw):
                 other = re.search(rb'\br="([A-Z]+\d+)"', existing.group())[1].decode()
@@ -187,13 +213,13 @@ def workbook_parts(z: ZipFile):
     return strings, sheets
 
 
-def calculate(points: list[Point]) -> tuple[int | None, Decimal | None]:
+def calculate(points: list[Point]) -> tuple[Decimal | int | None, Decimal | None]:
     if len(points) < 2:
         return None, None
     if points[-1].sales < points[-2].sales:
         return 0, points[-2].sales
     if points[-1].sales < 100000:
-        return rounded(below_cap(points)), None
+        return nonnegative(below_cap(points)), None
     rate = None
     start = 0
     for i in range(1, len(points)):
@@ -207,7 +233,91 @@ def calculate(points: list[Point]) -> tuple[int | None, Decimal | None]:
             rate = (current.sales - previous.sales) / Decimal(days)
         if current.sales != previous.sales:
             start = i
-    return rounded(rate), None
+    return nonnegative(rate), None
+
+
+def copy_column_format(data: bytes, source_col: str, target_col: str):
+    """复制整列默认样式、列宽和逐行样式；保留各列可见性。"""
+    root = ET.fromstring(data)
+    cols = root.find('s:cols', NS)
+    source_index, target_index = column_index(source_col), column_index(target_col)
+    source_attrs = {}
+    if cols is not None:
+        for col in cols:
+            if int(col.get('min')) <= source_index <= int(col.get('max')):
+                source_attrs = col.attrib
+                break
+    properties = ('style', 'width', 'customWidth', 'bestFit')
+    records, target_found = [], False
+    for col in ([] if cols is None else cols):
+        attrs = dict(col.attrib)
+        low, high = int(attrs['min']), int(attrs['max'])
+        if not low <= target_index <= high:
+            records.append(attrs)
+            continue
+        target_found = True
+        if low < target_index:
+            records.append(dict(attrs, max=str(target_index - 1)))
+        middle = dict(attrs, min=str(target_index), max=str(target_index))
+        for key in properties:
+            middle.pop(key, None)
+            if key in source_attrs:
+                middle[key] = source_attrs[key]
+        records.append(middle)
+        if target_index < high:
+            records.append(dict(attrs, min=str(target_index + 1)))
+    if not target_found:
+        records.append(dict(min=str(target_index), max=str(target_index),
+                            **{key: source_attrs[key] for key in properties if key in source_attrs}))
+    records.sort(key=lambda attrs: int(attrs['min']))
+    new_cols = ('<cols>' + ''.join('<col ' + ' '.join(f'{key}="{value}"' for key, value in attrs.items()) + '/>' for attrs in records) + '</cols>').encode()
+    if cols is not None:
+        data = re.sub(rb'<cols\b[^>]*>.*?</cols>', lambda _: new_cols, data, count=1, flags=re.DOTALL)
+    else:
+        data = data.replace(b'<sheetData', new_cols + b'<sheetData', 1)
+    styles = {}
+    for row in root.findall('s:sheetData/s:row', NS):
+        source_cell = next((c for c in row if c.get('r') == source_col + row.get('r')), None)
+        fallback = row.get('s', source_attrs.get('style', '0'))
+        styles[target_col + row.get('r')] = source_cell.get('s', fallback) if source_cell is not None else fallback
+    return data, styles
+
+
+def calculation_formula(points: list[Point], refs: list[str], daily_refs: list[str | None]) -> str:
+    """Python 选定历史区间；公式保留销量引用、实际天数和非负保护。"""
+    def growth(i, start):
+        days = (points[i].day - points[start].day).days
+        return f'({refs[i]}-{refs[i-1]})/{days}'
+
+    if points[-1].sales < points[-2].sales:
+        return '0'
+    if points[-1].sales < 10000:
+        expression = growth(len(points) - 1, len(points) - 2)
+    else:
+        expression, start = None, 0
+        high = points[-1].sales >= 100000
+        for i, current in enumerate(points):
+            if i:
+                previous = points[i - 1]
+                if high:
+                    if current.sales > previous.sales and current.sales != 100000:
+                        expression = growth(i, i - 1 if current.sales < 10000 else start)
+                elif current.sales < previous.sales:
+                    expression = '0'
+                elif current.sales < 10000:
+                    expression = growth(i, i - 1)
+                elif current.sales != previous.sales:
+                    expression = growth(i, start)
+                else:
+                    days = (current.day - points[start].day).days
+                    expression = f'MIN(MAX(0,{expression}),1000/{days})' if expression else '0'
+                if current.sales != previous.sales:
+                    start = i
+            if not high and i < len(points) - 1 and current.daily is not None:
+                expression = f'MAX(0,{daily_refs[i]})'
+        if expression is None:
+            raise ValueError('缺少可计算的增长区间')
+    return f'MAX(0,{expression})'
 
 
 def process(source: Path, output: Path | None = None, *, sheet: str | None = None,
@@ -250,6 +360,9 @@ def process(source: Path, output: Path | None = None, *, sheet: str | None = Non
         if columns['daily'][-1][0] != latest_day:
             raise ValueError('最新销量和最新日销日期不一致，请检查表头')
         daily_col = columns['daily'][-1][1]
+        if len(columns['daily']) < 2:
+            raise ValueError('缺少上一列日销，无法复制格式')
+        formatted_raw, styles = copy_column_format(raw, columns['daily'][-2][1], daily_col)
         daily_map = dict(columns['daily'])
         edits = {}
         stats = dict(sheet=name, date=latest_day.isoformat(), sales_column=sales_col,
@@ -263,18 +376,21 @@ def process(source: Path, output: Path | None = None, *, sheet: str | None = Non
                 stats['skipped'] += 1
                 continue
             points = []
+            refs, daily_refs = [], []
             for day, col in columns['sales']:
                 value = number(cells.get(col), strings, sales=True)
                 if value is not None:
                     historical_daily = number(cells.get(daily_map.get(day)), strings) if day < latest_day else None
                     points.append(Point(day, value, historical_daily))
+                    refs.append(col + row_id)
+                    daily_refs.append(daily_map[day] + row_id if day in daily_map else None)
             value, corrected = calculate(points)
-            edits[daily_col + row_id] = value
+            edits[daily_col + row_id] = Formula(calculation_formula(points, refs, daily_refs), value) if value is not None else None
             stats['blank' if value is None else 'calculated'] += 1
             if corrected is not None:
                 edits[sales_col + row_id] = corrected
                 stats['corrected'] += 1
-        patched = patch_xml(raw, edits)
+        patched = patch_xml(formatted_raw, edits, styles)
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(dir=output.parent, suffix='.xlsx', delete=False) as temp:
             temp_path = Path(temp.name)

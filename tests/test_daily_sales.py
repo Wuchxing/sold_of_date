@@ -6,7 +6,7 @@ import unittest
 from zipfile import ZipFile
 from xml.etree import ElementTree as ET
 
-from daily_sales import Point, calculate, patch_xml, process, NS, discover_columns, number
+from daily_sales import Point, calculate, patch_xml, process, NS, discover_columns, number, Formula, calculation_formula, copy_column_format
 
 
 def points(values, days=None, daily=None):
@@ -19,8 +19,8 @@ class CalculationTests(unittest.TestCase):
     def test_missing_history(self):
         self.assertEqual(calculate(points([100])), (None, None))
 
-    def test_small_sales_round_half_up(self):
-        self.assertEqual(calculate(points([100, 105], [0, 2])), (3, None))
+    def test_small_sales_preserves_fraction(self):
+        self.assertEqual(calculate(points([100, 105], [0, 2])), (D("2.5"), None))
 
     def test_drop(self):
         self.assertEqual(calculate(points([12000, 11000])), (0, D(12000)))
@@ -60,6 +60,55 @@ class CalculationTests(unittest.TestCase):
 
     def test_zero_sales_is_value(self):
         self.assertEqual(calculate(points([0, 0])), (0, None))
+
+
+class FormulaTests(unittest.TestCase):
+    def test_formulas_reference_actual_intervals(self):
+        scenarios = [
+            ([100, 105], [0, 2], None, 'MAX(0,(B2-A2)/2)'),
+            ([12000, 12000, 13000], [0, 4, 10], None, 'MAX(0,(C2-B2)/10)'),
+            ([12000, 12000], [0, 20], [100, None], 'MAX(0,MIN(MAX(0,MAX(0,X2)),1000/20))'),
+            ([97000, 99000, 100000, 100000], [0, 10, 11, 100], None, 'MAX(0,(B2-A2)/10)'),
+            ([99000, 100000, 100000, 104000], [0, 1, 5, 21], None, 'MAX(0,(D2-C2)/20)'),
+            ([12000, 11000], [0, 1], None, '0'),
+        ]
+        for values, days, daily, expected in scenarios:
+            with self.subTest(values=values):
+                history = points(values, days, daily)
+                self.assertEqual(calculation_formula(history, [f'{chr(65+i)}2' for i in range(len(values))],
+                                                     [f'{chr(88+i)}2' for i in range(len(values))]), expected)
+
+    def test_formula_without_historical_daily(self):
+        formula = calculation_formula(points([11000, 12000, 12000], [0, 10, 30]), ['A2', 'B2', 'C2'], [None]*3)
+        self.assertEqual(formula, 'MAX(0,MIN(MAX(0,(B2-A2)/10),1000/20))')
+
+    def test_entire_column_including_blanks(self):
+        raw = (f'<worksheet xmlns="{NS["s"]}"><cols><col min="1" max="2" style="5" width="10"/>'
+               '<col min="3" max="5" style="8" width="20"/></cols><sheetData>'
+               '<row r="1"><c r="B1" s="7"/><c r="D1" s="9"/></row>'
+               '<row r="2"><c r="B2" s="6"/><c r="D2"><v>77</v></c></row>'
+               '<row r="3"><c r="A3"/></row><row r="4"/></sheetData></worksheet>').encode()
+        formatted, styles = copy_column_format(raw, 'B', 'D')
+        result = ET.fromstring(patch_xml(formatted, {}, styles))
+        cells = {c.get('r'): c for c in result.findall('.//s:c', NS)}
+        self.assertEqual(cells['D1'].get('s'), '7')
+        self.assertEqual(cells['D2'].get('s'), '6')
+        self.assertEqual(cells['D2'].find('s:v', NS).text, '77')
+        self.assertEqual(cells['D3'].get('s'), '5')
+        self.assertIsNone(cells['D3'].find('s:v', NS))
+        self.assertEqual(cells['D4'].get('s'), '5')
+        self.assertIsNone(cells['D4'].find('s:v', NS))
+        columns = result.find('s:cols', NS)
+        self.assertEqual([(c.get('min'), c.get('max'), c.get('style')) for c in columns],
+                         [('1','2','5'), ('3','3','8'), ('4','4','5'), ('5','5','8')])
+
+    def test_formula_cache_written(self):
+        raw = b'<row r="2"><c r="A2" s="8"><v>99</v></c></row>'
+        result = ET.fromstring(patch_xml(raw, {'A2': Formula('MAX(0,(B2-C2)/6)', D('2.5'))}, {'A2': '7'}))
+        cell = result.find('c')
+        self.assertEqual(cell.get('s'), '7')
+        self.assertEqual(cell.find('f').text, 'MAX(0,(B2-C2)/6)')
+        self.assertEqual(cell.find('v').text, '2.5')
 
 
 class FileTests(unittest.TestCase):
@@ -128,8 +177,9 @@ class FileTests(unittest.TestCase):
                         self.assertEqual(z.read(key), parts[key])
                 root = ET.fromstring(z.read('xl/worksheets/sheet1.xml'))
                 cells = {c.get('r'): c for c in root.findall('.//s:c', NS)}
-                self.assertEqual(cells['D2'].find('s:v', NS).text, '3')
+                self.assertEqual(cells['D2'].find('s:v', NS).text, '2.5')
                 self.assertEqual(cells['D2'].get('s'), '4')
+                self.assertEqual(cells['D2'].find('s:f', NS).text, 'MAX(0,(B2-A2)/6)')
                 self.assertEqual(cells['B3'].find('s:v', NS).text, '100')
                 self.assertEqual(cells['D3'].find('s:v', NS).text, '0')
                 self.assertEqual(cells['D4'].find('s:v', NS).text, '77')
