@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+
+password.md
+.env
+.venv/

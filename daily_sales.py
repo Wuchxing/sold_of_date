@@ -1,4 +1,4 @@
-"""累计销量日销计算。仅依赖 Python 标准库，保留 XLSX 包中非目标内容。"""
+"""累计销量日销计算。默认仅依赖标准库；-a 额外计算人民币价格，保留 XLSX 非目标内容。"""
 from __future__ import annotations
 
 import argparse
@@ -97,9 +97,17 @@ def number(cell: ET.Element | None, strings: list[str], *, sales: bool = False) 
     return result
 
 
-def discover_columns(row: ET.Element, strings: list[str], latest_year: int):
+def discover_columns(row: ET.Element, strings: list[str], latest_year: int, *, include_prices=False):
     groups = {'sales': [], 'daily': []}
+    if include_prices:
+        groups['prices'] = []
     for cell in row:
+        label = (cell_value(cell, strings) or '').strip()
+        if include_prices and label.endswith('价格'):
+            match = HEADER.fullmatch(label[:-2] + '销量')
+            if match:
+                y, m, d, _ = match.groups()
+                groups['prices'].append((re.sub(r'\d', '', cell.get('r')), int(y) if y else None, int(m), int(d)))
         match = HEADER.fullmatch((cell_value(cell, strings) or '').strip())
         if match:
             y, m, d, kind = match.groups()
@@ -135,10 +143,23 @@ def column_index(ref: str) -> int:
 
 
 def patch_xml(data: bytes, edits: dict[str, int | Decimal | Formula | None],
-              styles: dict[str, str] | None = None) -> bytes:
+              styles: dict[str, str] | None = None, *, replace_shared_groups=False) -> bytes:
     """只替换目标单元格值；其余 XML 字节（包括样式与图片公式）保持原样。"""
     remaining = dict(edits)
     pending_styles = dict(styles or {})
+    safe_shared = set()
+    if replace_shared_groups:
+        groups = {}
+        for cell in ET.fromstring(data).iter():
+            if cell.tag.split('}')[-1] != 'c':
+                continue
+            for formula in cell:
+                if formula.tag.split('}')[-1] == 'f' and formula.get('t') == 'shared':
+                    groups.setdefault(formula.get('si'), []).append((cell.get('r'), formula))
+        for group_id, members in groups.items():
+            if group_id is not None and all(ref in edits for ref, _ in members) and any(f.text and f.get('ref') for _, f in members):
+                safe_shared.update(ref for ref, _ in members)
+
 
     def value_xml(value):
         if isinstance(value, Formula):
@@ -162,7 +183,7 @@ def patch_xml(data: bytes, edits: dict[str, int | Decimal | Formula | None],
         opening = raw[:raw.index(b'>') + 1].replace(b'/>', b'>')
         opening = re.sub(rb'\s+t="[^"]*"', b'', opening)
         body = b'' if raw.endswith(b'/>') else raw[raw.index(b'>') + 1:-4]
-        if re.search(rb'<f\b[^>]*\bt="(?:shared|array)"', body):
+        if re.search(rb'<f\b[^>]*\bt="(?:shared|array)"', body) and ref not in safe_shared:
             raise ValueError(f'{ref} 含共享或数组公式，不支持局部替换')
         body = re.sub(rb'<(?:v|f|is)\b[^>]*?(?:/>|>.*?</(?:v|f|is)>)', b'', body, flags=re.DOTALL)
         val = value_xml(value)
@@ -320,8 +341,51 @@ def calculation_formula(points: list[Point], refs: list[str], daily_refs: list[s
     return f'MAX(0,{expression})'
 
 
+def price_edits(rows, header, strings, year, config_path):
+    from exchange_rates import fetch_rates
+    columns = discover_columns(header, strings, year, include_prices=True)
+    if not columns['prices']:
+        raise ValueError('未找到日期价格列')
+    labels = {}
+    for cell in header:
+        label = (cell_value(cell, strings) or '').strip()
+        if label in ('站点', '人民币'):
+            if label in labels:
+                raise ValueError(f'表头 {label} 重复')
+            labels[label] = re.sub(r'\d', '', cell.get('r'))
+    if not all(label in labels for label in ('站点', '人民币')):
+        raise ValueError('价格计算需要站点和人民币列')
+    day, column = columns['prices'][-1]
+    pending = []
+    for row in rows:
+        row_id = row.get('r')
+        if int(row_id) <= int(header.get('r')):
+            continue
+        cells = {re.sub(r'\d', '', c.get('r')): c for c in row}
+        site_cell = cells.get(labels['站点'])
+        site = (cell_value(site_cell, strings) or '').strip() if site_cell is not None else ''
+        pending.append((row_id, cells, site))
+    rates = fetch_rates(day, {site for _, _, site in pending if site}, config_path)
+    edits = {}
+    skipped_rate, skipped_price = 0, 0
+    for row_id, cells, site in pending:
+        if site not in rates:
+            skipped_rate += 1
+            continue
+        price = number(cells.get(column), strings)
+        if price is None:
+            skipped_price += 1
+            continue
+        rate = rates[site]
+        edits[labels['人民币'] + row_id] = Formula(f'{column}{row_id}*{format(rate, "f")}', price * rate)
+    return edits, dict(price_date=day.isoformat(), price_calculated=len(edits),
+                       price_skipped_rate=skipped_rate, price_skipped_empty=skipped_price,
+                       price_missing_sites=sorted({site for _, _, site in pending if site and site not in rates}))
+
+
 def process(source: Path, output: Path | None = None, *, sheet: str | None = None,
-            year: int | None = None) -> dict:
+            year: int | None = None, all_calculations: bool = False,
+            db_config: Path | None = None) -> dict:
     source = Path(source).resolve()
     if source.suffix.lower() != '.xlsx':
         raise ValueError('仅支持 .xlsx 文件')
@@ -331,10 +395,11 @@ def process(source: Path, output: Path | None = None, *, sheet: str | None = Non
             raise ValueError('表头没有年份：请用 --year 指定最新销量所在年份')
         year = int(match[1])
     if output is None:
-        output = source.with_name(source.stem + '_日销已计算.xlsx')
+        suffix = '_价格与日销已计算' if all_calculations else '_日销已计算'
+        output = source.with_name(source.stem + suffix + '.xlsx')
         i = 2
         while output.exists():
-            output = source.with_name(source.stem + f'_日销已计算_{i}.xlsx')
+            output = source.with_name(source.stem + suffix + f'_{i}.xlsx')
             i += 1
     output = Path(output).resolve()
     if source == output or output.exists():
@@ -390,7 +455,12 @@ def process(source: Path, output: Path | None = None, *, sheet: str | None = Non
             if corrected is not None:
                 edits[sales_col + row_id] = corrected
                 stats['corrected'] += 1
-        patched = patch_xml(formatted_raw, edits, styles)
+        if all_calculations:
+            from exchange_rates import DEFAULT_CONFIG
+            prices, price_stats = price_edits(rows, header, strings, year, db_config or DEFAULT_CONFIG)
+            edits.update(prices)
+            stats.update(price_stats)
+        patched = patch_xml(formatted_raw, edits, styles, replace_shared_groups=all_calculations)
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(dir=output.parent, suffix='.xlsx', delete=False) as temp:
             temp_path = Path(temp.name)
@@ -419,6 +489,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('file', nargs='?', help='输入 XLSX 路径；省略时弹出选择窗口')
     parser.add_argument('-o', '--output', type=Path)
+    parser.add_argument('-a', '--all', dest='all_calculations', action='store_true', help='同时计算人民币价格和日销')
+    parser.add_argument('--db-config', type=Path, help='MySQL 配置文件路径，仅 -a 使用')
     parser.add_argument('--sheet', help='数据工作表名称，默认自动识别')
     parser.add_argument('--year', type=int, help='最新销量年份；默认读取文件名日期中的年份')
     args = parser.parse_args()
@@ -435,11 +507,16 @@ def main():
         if not args.file:
             return
     try:
-        result = process(Path(args.file), args.output, sheet=args.sheet, year=args.year)
+        result = process(Path(args.file), args.output, sheet=args.sheet, year=args.year,
+                         all_calculations=args.all_calculations, db_config=args.db_config)
     except (ValueError, OSError, ET.ParseError) as exc:
         parser.exit(1, f'处理失败：{exc}\n')
     print(f"完成：{result['calculated']} 行日销，{result['blank']} 行历史不足留空，"
           f"{result['skipped']} 行最新销量为空跳过，{result['corrected']} 行销量下降已更正。")
+    if args.all_calculations:
+        print(f"价格：{result['price_calculated']} 行计算，{result['price_skipped_rate']} 行无汇率/站点跳过，{result['price_skipped_empty']} 行价格为空跳过。")
+        if result['price_missing_sites']:
+            print('缺少汇率的站点：' + '、'.join(result['price_missing_sites']))
     print(result['output'])
 
 
