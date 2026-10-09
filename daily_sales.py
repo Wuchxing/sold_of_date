@@ -386,6 +386,31 @@ def price_edits(rows, header, strings, year, config_path):
 def process(source: Path, output: Path | None = None, *, sheet: str | None = None,
             year: int | None = None, all_calculations: bool = False,
             db_config: Path | None = None) -> dict:
+    from run_log import RunLog
+    import sys
+    log = RunLog(source, output, all_calculations)
+    error = None
+    result = None
+    try:
+        result = _process(source, output, sheet=sheet, year=year,
+                          all_calculations=all_calculations, db_config=db_config, log=log)
+        return result
+    except BaseException as exc:
+        error = exc
+        raise
+    finally:
+        try:
+            path = log.finish(error)
+        except Exception:
+            print('警告：运行日志写入失败，请检查本地应用数据目录权限和磁盘空间。', file=sys.stderr)
+        else:
+            if result is not None:
+                result['log_path'] = str(path)
+            else:
+                print(f'日志：{path}', file=sys.stderr)
+
+
+def _process(source, output, *, sheet, year, all_calculations, db_config, log):
     source = Path(source).resolve()
     if source.suffix.lower() != '.xlsx':
         raise ValueError('仅支持 .xlsx 文件')
@@ -402,8 +427,10 @@ def process(source: Path, output: Path | None = None, *, sheet: str | None = Non
             output = source.with_name(source.stem + suffix + f'_{i}.xlsx')
             i += 1
     output = Path(output).resolve()
+    log.output = str(output)
     if source == output or output.exists():
         raise ValueError('输出路径必须是尚不存在的新文件，不能覆盖源文件或现有结果')
+    log.stage = '读取工作簿'
     with ZipFile(source) as zin:
         strings, sheets = workbook_parts(zin)
         candidates = []
@@ -432,6 +459,9 @@ def process(source: Path, output: Path | None = None, *, sheet: str | None = Non
         edits = {}
         stats = dict(sheet=name, date=latest_day.isoformat(), sales_column=sales_col,
                      daily_column=daily_col, calculated=0, blank=0, skipped=0, corrected=0)
+        stats['total_rows'] = sum(int(row.get('r')) > int(header.get('r')) for row in rows)
+        log.stats = stats
+        log.stage = '日销计算'
         for row in rows:
             row_id = row.get('r')
             if int(row_id) <= int(header.get('r')):
@@ -456,10 +486,12 @@ def process(source: Path, output: Path | None = None, *, sheet: str | None = Non
                 edits[sales_col + row_id] = corrected
                 stats['corrected'] += 1
         if all_calculations:
+            log.stage = '价格计算与汇率读取'
             from exchange_rates import DEFAULT_CONFIG
             prices, price_stats = price_edits(rows, header, strings, year, db_config or DEFAULT_CONFIG)
             edits.update(prices)
             stats.update(price_stats)
+        log.stage = '写入与校验结果文件'
         patched = patch_xml(formatted_raw, edits, styles, replace_shared_groups=all_calculations)
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(dir=output.parent, suffix='.xlsx', delete=False) as temp:
@@ -482,6 +514,7 @@ def process(source: Path, output: Path | None = None, *, sheet: str | None = Non
         finally:
             temp_path.unlink(missing_ok=True)
     stats['output'] = str(output)
+    log.stage = '完成'
     return stats
 
 
@@ -518,6 +551,8 @@ def main():
         if result['price_missing_sites']:
             print('缺少汇率的站点：' + '、'.join(result['price_missing_sites']))
     print(result['output'])
+    if result.get('log_path'):
+        print(f"日志：{result['log_path']}")
 
 
 if __name__ == '__main__':
